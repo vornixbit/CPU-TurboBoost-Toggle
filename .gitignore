@@ -1,0 +1,12 @@
+config.json
+
+# .NET build outputs
+bin/
+obj/
+*.user
+*.exe
+*.log
+*.log.*
+*.tmp
+.vs/
+TestResults/
