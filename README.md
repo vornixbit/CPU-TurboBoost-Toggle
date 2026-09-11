@@ -8,6 +8,8 @@ A tiny Windows system-tray tool that toggles Intel Turbo Boost on and off with o
 2. Run it, allow the UAC prompt, the tray icon appears. No installation step.
    The exe is unsigned: SmartScreen shows "Unknown publisher" (More info → Run anyway).
 
+- [VirusTotal Report](https://www.virustotal.com/gui/file/1a69832f9bc56aab23b1775bb6f1457f9bbf2673ec86a4c83584bed7a8861596)
+
 ## Features
 
 Tray icon (green/grey), fast Enable/Disable, global hotkey with 6 presets + custom capture
@@ -52,3 +54,4 @@ MIT - see [LICENSE](LICENSE) for details.
 - Requires administrator rights, needed for power scheme modification (UAC prompt on every start)
 - Intel-only, AMD Turbo Core is not supported by this power API
 - Unsigned executable, SmartScreen warning on first run
+
