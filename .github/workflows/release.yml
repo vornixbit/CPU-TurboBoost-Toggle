@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to release (e.g. v1.0.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: "10.0.x"
+          cache: true
+          cache-dependency-path: src/TurboToggle.csproj
+
+      - name: Build
+        run: dotnet build src/TurboToggle.csproj -c Release
+
+      - name: Publish (win-x64, self-contained, single file)
+        run: >
+          dotnet publish src/TurboToggle.csproj -c Release -r win-x64
+          --self-contained -p:PublishSingleFile=true
+          -p:EnableCompressionInSingleFile=true
+          -o publish/win-x64
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: TurboToggle-win-x64
+          path: publish/win-x64/TurboToggle.exe
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: TurboToggle-win-x64
+          path: assets
+
+      - name: Publish release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+          repo="${GITHUB_REPOSITORY}"
+          if gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
+            gh release upload "$tag" assets/TurboToggle.exe --repo "$repo" --clobber
+          else
+            gh release create "$tag" assets/TurboToggle.exe \
+              --repo "$repo" \
+              --verify-tag \
+              --title "Turbo Boost Toggle $tag" \
+              --notes "Automated build of Turbo Boost Toggle $tag."
+          fi
