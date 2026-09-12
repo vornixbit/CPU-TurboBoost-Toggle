@@ -2,6 +2,9 @@
 
 A tiny Windows system-tray tool that toggles Intel Turbo Boost on and off with one click or a global hotkey. Very convenient for laptops when you want to switch it in real time.
 
+<img width="292" height="232" alt="image" src="https://github.com/user-attachments/assets/562d354e-e6c6-40af-b094-cf306ebed834" />
+
+
 ## Install
 
 1. Download `TurboToggle.exe` from [Releases](../../releases/latest).
