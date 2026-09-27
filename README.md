@@ -7,15 +7,26 @@ A tiny Windows system-tray tool that toggles Intel Turbo Boost on and off with o
 
 ## Install
 
-1. Download `TurboToggle.exe` from [Releases](../../releases/latest).
+### Portable
+
+1. Download `TurboToggle-portable.exe` from [Releases](../../releases/latest).
 2. Run it, allow the UAC prompt, the tray icon appears. No installation step.
-   The exe is unsigned: SmartScreen shows "Unknown publisher" (More info → Run anyway).
+
+### Installer (MSI)
+
+1. Download `TurboToggle-VERSION-setup.msi` from [Releases](../../releases/latest).
+2. Double-click, follow the wizard. Installs to `Program Files\Turbo Toggle`.
+
+The exe is unsigned: SmartScreen shows "Unknown publisher" (More info → Run anyway).
+
+Both versions require administrator privileges. Settings live in `%APPDATA%\TurboToggle`.
+
 
 - [VirusTotal Report](https://www.virustotal.com/gui/file/1a69832f9bc56aab23b1775bb6f1457f9bbf2673ec86a4c83584bed7a8861596)
 
 ## Features
 
-Tray icon (green/grey), fast Enable/Disable, global hotkey with 6 presets + custom capture
+Tray icon (green/grey), Enable/Disable TurboBoost, global hotkey with 6 presets + custom capture
 (can be turned off entirely), Copilot-key support, en/ru/uk/zh languages, autostart, Windows 11 power-mode overlay support.
 - **Portable:** no installer and no dependencies. A single self-contained `TurboToggle.exe` (~50 MB) that runs from any folder.
 Settings live in `%APPDATA%\TurboToggle`, nothing else is written to the system (except the optional autostart entry, only if you enable it).

@@ -10,3 +10,8 @@ obj/
 *.tmp
 .vs/
 TestResults/
+
+# WiX installer build outputs
+setup/bin/
+setup/obj/
+*.msi

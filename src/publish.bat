@@ -50,8 +50,34 @@ if errorlevel 1 (
 )
 
 echo.
-echo Done: %~dp0bin\Release\net10.0-windows\%RID%\publish\TurboToggle.exe
+echo Done: %~dp0bin\Release\net10.0-windows\%RID%\publish\TurboToggle-portable.exe
 echo Usage: publish.bat [x64] [version]
+
+rem --- Optional: Build MSI installer ---
+if not defined VER (
+    echo.
+    echo Skipping MSI installer build ^(no version specified^).
+    echo Usage: publish.bat [x64] [version]
+) else if not exist "%~dp0..\setup\TurboToggle.wxs" (
+    echo.
+    echo Skipping MSI installer build ^(setup\TurboToggle.wxs not found^).
+) else (
+    where wix >nul 2>nul
+    if errorlevel 1 (
+        echo.
+        echo WARNING: WiX v5 not found. Skipping MSI build.
+        echo Install with: dotnet tool install --global wix
+    ) else (
+        echo.
+        echo Building MSI installer...
+        wix build "%~dp0..\setup\TurboToggle.wxs" -d Version=%VER% -d SourcePath=%~dp0bin\Release\net10.0-windows\%RID%\publish -o "%~dp0bin\Release\net10.0-windows\%RID%\publish\TurboToggle-%VER%-setup.msi"
+        if errorlevel 1 (
+            echo ERROR: MSI build failed.
+            exit /b 1
+        )
+    )
+)
+
 if "%CI%"=="" if "%~1"=="" pause
 exit /b 0
 

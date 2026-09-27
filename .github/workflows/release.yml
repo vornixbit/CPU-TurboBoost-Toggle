@@ -75,21 +75,49 @@ jobs:
           -p:Version=${{ env.VERSION }}
           -o publish/win-x64
 
-      - name: Upload artifact
+      - name: Rename portable exe
+        shell: bash
+        run: mv publish/win-x64/TurboToggle.exe publish/win-x64/TurboToggle-portable.exe
+
+      - name: Install WiX v5
+        run: dotnet tool install --global wix --version 5.0.2
+
+      - name: Build MSI installer
+        shell: bash
+        run: |
+          wix build setup/TurboToggle.wxs \
+            -d Version="${VERSION}" \
+            -d SourcePath="${GITHUB_WORKSPACE}/publish/win-x64" \
+            -o "publish/TurboToggle-${VERSION}-setup.msi"
+
+      - name: Upload portable artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: TurboToggle-win-x64
-          path: publish/win-x64/TurboToggle.exe
+          name: TurboToggle-win-x64-portable
+          path: publish/win-x64/TurboToggle-portable.exe
+          if-no-files-found: error
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: TurboToggle-win-x64-setup
+          path: publish/TurboToggle-${{ env.VERSION }}-setup.msi
           if-no-files-found: error
 
   release:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - name: Download artifact
+      - name: Download portable artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          name: TurboToggle-win-x64
+          name: TurboToggle-win-x64-portable
+          path: assets
+
+      - name: Download installer artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: TurboToggle-win-x64-setup
           path: assets
 
       - name: Publish release
@@ -106,12 +134,34 @@ jobs:
             tag="${GITHUB_REF_NAME}"
           fi
           repo="${GITHUB_REPOSITORY}"
+          version="${tag#v}"
           if gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
-            gh release upload "$tag" assets/TurboToggle.exe --repo "$repo" --clobber
+            gh release upload "$tag" assets/TurboToggle-portable.exe --repo "$repo" --clobber
+            gh release upload "$tag" "assets/TurboToggle-${version}-setup.msi" --repo "$repo" --clobber
           else
-            gh release create "$tag" assets/TurboToggle.exe \
+            gh release create "$tag" \
+              assets/TurboToggle-portable.exe \
+              "assets/TurboToggle-${version}-setup.msi" \
               --repo "$repo" \
               --verify-tag \
               --title "Turbo Boost Toggle $tag" \
-              --notes "Automated build of Turbo Boost Toggle $tag."
+              --notes "$(cat <<EOF
+          Automated build of Turbo Boost Toggle ${tag}.
+
+          ## Assets
+
+          | File | Description |
+          |------|-------------|
+          | \`TurboToggle-portable.exe\` | Portable single-file executable. Run from any folder. |
+          | \`TurboToggle-${version}-setup.msi\` | Windows Installer (MSI). Installs to Program Files with Start Menu shortcut. Supports upgrade/uninstall via Windows Settings. |
+
+          ## Installation
+
+          **Portable:** Download \`TurboToggle-portable.exe\`, run it, allow the UAC prompt. No installation needed.
+
+          **Installer:** Download the \`.msi\`, double-click, follow the wizard. The app installs to \`Program Files\\Turbo Toggle\` and adds a Start Menu shortcut. Uninstall via Settings > Apps > Installed apps.
+
+          Both versions require administrator privileges and store settings in \`%APPDATA%\\TurboToggle\`.
+          EOF
+          )"
           fi
