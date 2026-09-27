@@ -22,10 +22,13 @@ if defined VER call :stripv
 if defined VER call :checkver
 if errorlevel 1 exit /b 1
 
-taskkill /F /IM TurboToggle.exe >nul 2>nul
-tasklist /FI "IMAGENAME eq TurboToggle.exe" 2>nul | find /i "TurboToggle.exe" >nul
-if not errorlevel 1 (
-    echo WARNING: could not kill running TurboToggle.exe - run publish.bat as admin or Quit from tray.
+rem Only stop instances launched from this repository tree; a foreign
+rem TurboToggle.exe running from elsewhere must never be killed, and it does
+rem not block the publish either - only an instance from %~dp0 locks the output.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Get-Process -Name TurboToggle -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith('%~dp0') } | Stop-Process -Force -ErrorAction SilentlyContinue" >nul 2>nul
+powershell -NoProfile -ExecutionPolicy Bypass -Command "if (Get-Process -Name TurboToggle -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith('%~dp0') }) { exit 1 }" >nul 2>nul
+if errorlevel 1 (
+    echo WARNING: could not stop the running TurboToggle.exe from this folder - run publish.bat as admin or Quit from tray.
 )
 
 if defined VER (

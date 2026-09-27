@@ -7,13 +7,11 @@ on:
       - "**/*.md"
       - "LICENSE"
       - ".gitignore"
-      - ".editorconfig"
   pull_request:
     paths-ignore:
       - "**/*.md"
       - "LICENSE"
       - ".gitignore"
-      - ".editorconfig"
   workflow_dispatch:
 
 permissions:
@@ -24,14 +22,59 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        # Pinned by SHA, same refs as release.yml, so CI cannot be moved by a
+        # retagged upstream release.
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Setup .NET
-        uses: actions/setup-dotnet@v6
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6
         with:
           dotnet-version: "10.0.x"
           cache: true
-          cache-dependency-path: src/TurboToggle.csproj
+          cache-dependency-path: |
+            src/TurboToggle.csproj
+            tests/TurboToggle.RegressionTests.csproj
+            Directory.Build.props
+            .editorconfig
+            global.json
 
       - name: Build
         run: dotnet build src/TurboToggle.csproj -c Release
+
+      - name: Regression tests (no system changes)
+        run: dotnet run --project tests/TurboToggle.RegressionTests.csproj -c Release
+
+      - name: Publish smoke test (single file, self-contained)
+        run: >
+          dotnet publish src/TurboToggle.csproj -c Release -r win-x64 --self-contained
+          -p:PublishSingleFile=true -p:EnableCompressionInSingleFile=true
+          -o ${{ runner.temp }}/tt-publish
+      - name: Verify the published single file
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = "${{ runner.temp }}/tt-publish/TurboToggle.exe"
+          if (-not (Test-Path $exe)) { throw "TurboToggle.exe was not produced" }
+          $mb = [math]::Round((Get-Item $exe).Length / 1MB, 1)
+          Write-Host "TurboToggle.exe: $mb MB"
+          if ($mb -lt 30 -or $mb -gt 70) { throw "Unexpected single-file size: $mb MB" }
+
+          $log = "$env:LOCALAPPDATA\TurboToggle\error.log"
+          Remove-Item $log -Force -ErrorAction SilentlyContinue
+          $p = $null
+          try { $p = Start-Process -FilePath $exe -PassThru -ErrorAction Stop }
+          catch {
+            if ($_.Exception.Message -match 'canceled by the user|elevat|740') {
+              Write-Host "elevation unavailable - start check skipped: $($_.Exception.Message)"
+            } else { throw "could not launch TurboToggle.exe: $($_.Exception.Message)" }
+          }
+          if ($p) {
+            if ($p.WaitForExit(10000)) {
+              if ($p.ExitCode -ne 0) { throw "TurboToggle.exe exited immediately with code $($p.ExitCode)" }
+              if (Test-Path $log) { throw "TurboToggle.exe logged a startup error:`n$(Get-Content $log -Raw)" }
+              Write-Warning "exited 0 within 10s (dialog path, e.g. single-instance) - inconclusive, not failed"
+            } else {
+              Write-Host "still running after 10s - start OK"
+              try { $p.Kill(); $p.WaitForExit(5000) | Out-Null } catch { Write-Host "kill failed: $_" }
+            }
+          }

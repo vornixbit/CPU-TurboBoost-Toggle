@@ -1,33 +1,32 @@
-using System;
-using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Runtime.InteropServices;
-using System.Threading;
-
 namespace TurboToggle;
-
 static class IconFactory
 {
     [DllImport("user32.dll", CharSet = CharSet.Auto)]
     static extern bool DestroyIcon(IntPtr handle);
-
-    static readonly Lazy<Icon> OnIcon = new(() => Create(on: true), LazyThreadSafetyMode.ExecutionAndPublication);
-    static readonly Lazy<Icon> OffIcon = new(() => Create(on: false), LazyThreadSafetyMode.ExecutionAndPublication);
-
-    public static Icon Get(bool on) => (on ? OnIcon : OffIcon).Value;
-
+    static Icon? _onIcon;
+    static Icon? _offIcon;
+    static readonly object _iconLock = new();
+    public static Icon Get(bool on)
+    {
+        lock (_iconLock)
+        {
+            if (on)
+                return _onIcon ??= Create(on: true);
+            return _offIcon ??= Create(on: false);
+        }
+    }
     static Icon Create(bool on)
     {
         using var bmp = new Bitmap(64, 64);
         using (var g = Graphics.FromImage(bmp))
         {
             g.SmoothingMode = SmoothingMode.AntiAlias;
-
             var color = on ? Color.FromArgb(76, 175, 80) : Color.FromArgb(140, 140, 140);
             using (var path = RoundedRect(new Rectangle(4, 4, 56, 56), 12))
             using (var brush = new SolidBrush(color))
                 g.FillPath(brush, path);
-
             using (var brush = new SolidBrush(Color.White))
                 g.FillPolygon(brush, new[]
                 {
@@ -36,7 +35,6 @@ static class IconFactory
                     new PointF(40, 10),
                 });
         }
-
         IntPtr hIcon = bmp.GetHicon();
         try
         {
@@ -48,7 +46,16 @@ static class IconFactory
             DestroyIcon(hIcon);
         }
     }
-
+    public static void Release()
+    {
+        lock (_iconLock)
+        {
+            _onIcon?.Dispose();
+            _onIcon = null;
+            _offIcon?.Dispose();
+            _offIcon = null;
+        }
+    }
     static GraphicsPath RoundedRect(Rectangle r, int radius)
     {
         var p = new GraphicsPath();

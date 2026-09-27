@@ -1,13 +1,10 @@
-using System;
 using System.Collections.Frozen;
-using System.Collections.Generic;
 using System.Runtime.InteropServices;
-
 namespace TurboToggle;
-
 static class Localization
 {
-    public static readonly string[] AllLangs = { "en", "ru", "uk", "zh" };
+    static readonly string[] LangCodes = ["en", "ru", "uk", "zh"];
+    public static readonly IReadOnlyList<string> AllLangs = Array.AsReadOnly(LangCodes);
     static readonly FrozenDictionary<string, string> LangNames = new Dictionary<string, string>
     {
         ["en"] = "English",
@@ -15,23 +12,19 @@ static class Localization
         ["uk"] = "Українська",
         ["zh"] = "简体中文",
     }.ToFrozenDictionary();
-
     static int _currentLangIdx;
-
     public static string Language
     {
-        get => AllLangs[_currentLangIdx];
+        get => LangCodes[_currentLangIdx];
         set
         {
-            _currentLangIdx = Array.IndexOf(AllLangs, value);
+            _currentLangIdx = Array.IndexOf(LangCodes, value);
             if (_currentLangIdx < 0)
                 _currentLangIdx = 0;
         }
     }
-
     [DllImport("kernel32.dll")]
     static extern ushort GetUserDefaultUILanguage();
-
     static readonly FrozenDictionary<string, string[]> Strings = new Dictionary<string, string[]>
     {
         ["status_on"]    = new[] { "Turbo Boost: On",      "Turbo Boost: Включен",      "Turbo Boost: Увімкнено", "Turbo Boost: 已启用" },
@@ -85,22 +78,18 @@ static class Localization
         ["disabled"] = new[] { "Disabled", "Отключена", "Вимкнена", "已禁用" },
         ["hotkey_unsupported"] = new[] { "— not supported", "— не поддерживается", "— не підтримується", "— 不支持" },
         ["hotkey_disabled"] = new[] { "Hotkey disabled.", "Горячая клавиша отключена.", "Гарячу клавішу вимкнено.", "快捷键已禁用。" },
-        ["admin_required"] = new[] { "Administrator rights are required to change power settings.", "Для изменения параметров питания требуются права администратора.", "Для зміни параметрів живлення потрібні права адміністратора.", "更改电源设置需要管理员权限。" },
+        ["startup_failed"] = new[] { "Failed to start Turbo Toggle. See the log in %LOCALAPPDATA%\\TurboToggle.", "Не удалось запустить Turbo Toggle. Подробности в журнале %LOCALAPPDATA%\\TurboToggle.", "Не вдалося запустити Turbo Toggle. Подробиці в журналі %LOCALAPPDATA%\\TurboToggle.", "Turbo Toggle 启动失败。详见 %LOCALAPPDATA%\\TurboToggle 中的日志。" },
     }.ToFrozenDictionary();
-
-    public static bool IsSupported(string code) => Array.IndexOf(AllLangs, code) >= 0;
-
+    public static bool IsSupported(string code) => Array.IndexOf(LangCodes, code) >= 0;
     public static string LangName(string code) =>
         LangNames.TryGetValue(code, out var name) ? name : code;
-
     public static string Tr(string key)
     {
         int idx = _currentLangIdx;
         return Strings.TryGetValue(key, out var arr) && arr.Length > 0
-            ? arr[idx < arr.Length ? idx : 0]
+            ? arr[idx >= 0 && idx < arr.Length ? idx : 0]
             : key;
     }
-
     public static string Detect()
     {
         try

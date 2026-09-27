@@ -2,27 +2,38 @@
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
-    <TargetFramework>net10.0-windows</TargetFramework>
-    <UseWindowsForms>true</UseWindowsForms>
-    <ImplicitUsings>enable</ImplicitUsings>
-    <Nullable>enable</Nullable>
-    <RootNamespace>TurboToggle</RootNamespace>
-    <AssemblyName>TurboToggle</AssemblyName>
-    <Version>1.0.0</Version>
+    <Version>1.0.2</Version>
     <Company>TurboToggle</Company>
     <Copyright>© 2026 TurboToggle</Copyright>
     <Product>Turbo Toggle</Product>
     <Title>Turbo Toggle</Title>
     <Description>System-tray toggle for Intel Turbo Boost (processor performance boost mode).</Description>
-    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
-    <EnableNETAnalyzers>true</EnableNETAnalyzers>
-    <AnalysisLevel>latest-recommended</AnalysisLevel>
-    <NoWarn>CA1816</NoWarn>
     <RuntimeIdentifiers>win-x64</RuntimeIdentifiers>
     <ApplicationManifest>app.manifest</ApplicationManifest>
-    <DebugType>embedded</DebugType>
+    <ApplicationIcon>icon.ico</ApplicationIcon>
+    <DebugType Condition="'$(Configuration)' == 'Release'">none</DebugType>
+    <DebugType Condition="'$(Configuration)' != 'Release'">embedded</DebugType>
     <InvariantGlobalization>true</InvariantGlobalization>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <PublishReadyToRun>true</PublishReadyToRun>
   </PropertyGroup>
+
+  <Target Name="PruneRuntimePackAssets" AfterTargets="ComputeResolvedFilesToPublishList">
+    <ItemGroup>
+      <ResolvedFileToPublish Remove="@(ResolvedFileToPublish)"
+        Condition="'%(ResolvedFileToPublish.Filename)' == 'System.Windows.Forms.Design'
+                    or '%(ResolvedFileToPublish.Filename)' == 'createdump'
+                    or '%(ResolvedFileToPublish.Filename)' == 'mscordbi'
+                    or '%(ResolvedFileToPublish.Filename)' == 'mscorrc'
+                    or '%(ResolvedFileToPublish.Filename)' == 'clrgc'
+                    or '%(ResolvedFileToPublish.Filename)' == 'clrgcexp'
+                    or '%(ResolvedFileToPublish.Filename)' == 'clretwrc'
+                    or '%(ResolvedFileToPublish.Filename)' == 'Microsoft.DiaSymReader.Native.amd64'
+                    or $([System.String]::Copy('%(ResolvedFileToPublish.Filename)').StartsWith('mscordaccore'))" />
+      <ResolvedFileToPublish Remove="@(ResolvedFileToPublish)"
+        Condition="'%(ResolvedFileToPublish.Filename)' == 'TurboToggle'
+                    and '%(ResolvedFileToPublish.Extension)' == '.xml'" />
+    </ItemGroup>
+  </Target>
 
 </Project>

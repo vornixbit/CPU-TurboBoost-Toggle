@@ -46,6 +46,17 @@ No need to disable anything in Windows and the classic "hotkey busy" problem doe
 - Output: `src\bin\Release\net10.0-windows\win-x64\publish\TurboToggle.exe`
 - Requires [.NET 10 SDK](https://dotnet.microsoft.com/download).
 
+## Regression checks
+
+On Windows, run:
+
+```powershell
+dotnet run --project tests/TurboToggle.RegressionTests.csproj -c Release
+```
+
+These checks do not start the tray application, install global keyboard hooks,
+change power settings/autostart, or write the user's configuration.
+
 The exe manifest requests administrator rights, so Windows shows the UAC prompt on start.
 
 ## License

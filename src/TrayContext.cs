@@ -1,73 +1,77 @@
-using System;
+using System.ComponentModel;
 using System.Diagnostics;
-using System.Threading;
-using System.Threading.Tasks;
-using System.Windows.Forms;
 using Microsoft.Win32;
-
 namespace TurboToggle;
-
 sealed class TrayContext : ApplicationContext
 {
-    const int PollIntervalMs = 2000;
+    const int PollIntervalMs = 120000;
     const int HotkeyRetryIntervalMs = 500;
     const int StartupUpdateDelayMs = 15000;
+    const int InitialStateRetryDelayMs = 2000;
     const int BalloonRateLimitSeconds = 2;
+    const int ImportantBalloonRepeatSeconds = 10;
     const int AutostartCacheTtlSeconds = 30;
-
+    const int BalloonRateLimitMs = BalloonRateLimitSeconds * 1000;
+    const int ImportantBalloonRepeatMs = ImportantBalloonRepeatSeconds * 1000;
+    const int AutostartCacheTtlMs = AutostartCacheTtlSeconds * 1000;
+    const int MaxHotkeyRetries = 4;
     readonly NotifyIcon _icon;
     readonly HotkeyWindow _hotkeyWindow;
     readonly CopilotHook _copilotHook = new();
-    readonly System.Windows.Forms.Timer _pollTimer;
+    readonly System.Windows.Forms.Timer _fallbackTimer;
     readonly System.Windows.Forms.Timer _hotkeyRetryTimer;
     readonly CancellationTokenSource _startupCts = new();
     readonly AppConfig _config;
-
-    ToolStripMenuItem _enableItem = null!;
-    ToolStripMenuItem _disableItem = null!;
-    ToolStripMenuItem _autostartItem = null!;
-    ToolStripMenuItem _restoreItem = null!;
-    ToolStripMenuItem _notificationsItem = null!;
-    ToolStripMenuItem _autoUpdateItem = null!;
-    ToolStripMenuItem _checkNowItem = null!;
-    ToolStripMenuItem _hotkeyOffItem = null!;
-    ToolStripMenuItem _hotkeyItem = null!;
-    ToolStripMenuItem _settingsItem = null!;
-
-    bool _turboOn;
-    uint _mods, _vk;
-    bool _hotkeyEnabled = true;
-    bool _restoreOnExit;
-    bool _notifications = true;
-    bool _autoUpdate = true;
-    bool _checkingUpdates;
-    string _updateUrl = "";
-    bool _updateClickArmed;
-    string _updateClickArmedFor = "";
-    uint _retryPrevMods, _retryPrevVk;
-    HotkeyEntry? _retryPrevEntry;
-    bool _retryPrevEnabled;
+    readonly SynchronizationContext? _ui;
+    readonly CancellationToken _shutdownToken;
+    ToolStripMenuItem? _enableItem;
+    ToolStripMenuItem? _disableItem;
+    ToolStripMenuItem? _autostartItem;
+    ToolStripMenuItem? _restoreItem;
+    ToolStripMenuItem? _notificationsItem;
+    ToolStripMenuItem? _autoUpdateItem;
+    ToolStripMenuItem? _checkNowItem;
+    ToolStripMenuItem? _hotkeyOffItem;
+    ToolStripMenuItem? _hotkeyItem;
+    ToolStripMenuItem? _settingsItem;
+    volatile bool _turboOn;
+    volatile uint _mods, _vk;
+    volatile bool _hotkeyEnabled = true;
+    volatile bool _restoreOnExit;
+    volatile bool _notifications = true;
+    volatile bool _autoUpdate = true;
+    volatile bool _checkingUpdates;
+    volatile string _updateUrl = "";
+    volatile bool _updateClickArmed;
+    volatile string _updateClickArmedFor = "";
+    volatile uint _retryPrevMods, _retryPrevVk;
+    volatile HotkeyEntry? _retryPrevEntry;
+    volatile bool _retryPrevEnabled;
     bool? _retryPrevEnabledCfg;
-    int _hotkeyRetries;
-    bool _exiting;
-    bool _applying;
-    bool _disposed;
-    bool _autostartCached;
-    bool _autostartBusy;
-    bool _restored;
+    volatile int _hotkeyRetries;
+    volatile bool _exiting;
+    volatile bool _applying;
+    volatile bool _disposed;
+    bool IsShuttingDown => _exiting || _disposed;
+    volatile bool _autostartCached;
+    volatile bool _autostartBusy;
+    int _restored;
     int _autostartSeq;
     bool _menuRebuildPending;
     bool _rebuildOnMenuClose;
-    DateTime _lastAutostartCheck = DateTime.MinValue;
-    DateTime _lastBalloon = DateTime.MinValue;
-
+    const long ExpiredTicks = long.MinValue;
+    static long AgeMs(long sinceTicks) =>
+        sinceTicks == ExpiredTicks ? long.MaxValue : Environment.TickCount64 - sinceTicks;
+    long _lastAutostartCheckTicks = ExpiredTicks;
+    long _lastBalloonTicks = ExpiredTicks;
+    string _lastBalloonText = "";
     public TrayContext(AppConfig config)
     {
         _config = config;
+        _shutdownToken = _startupCts.Token;
         Localization.Language = Localization.IsSupported(_config.Lang)
             ? _config.Lang
             : Localization.Detect();
-
         var saved = _config.Hotkey ?? new HotkeyEntry();
         _mods = saved.Mods;
         _vk = saved.Vk;
@@ -75,20 +79,18 @@ sealed class TrayContext : ApplicationContext
         _restoreOnExit = _config.RestoreOnExit;
         _notifications = _config.Notifications ?? true;
         _autoUpdate = _config.AutoUpdateCheck ?? true;
-
-        _turboOn = PowerApi.ReadState() ?? true;
-
+        var initialState = PowerApi.ReadState();
+        _turboOn = initialState ?? false;
         _hotkeyWindow = new HotkeyWindow();
         _hotkeyWindow.HotkeyPressed += OnHotkeyPressed;
         _copilotHook.Pressed += OnHotkeyPressed;
-
-        _autostartCached = false;
         _icon = new NotifyIcon
         {
             Icon = IconFactory.Get(_turboOn),
-            ContextMenuStrip = BuildMenu(),
+            ContextMenuStrip = BuildMenu() ?? FallbackMenu(),
             Visible = true,
         };
+        _ui = SynchronizationContext.Current;
         _icon.BalloonTipClicked += (_, _) =>
         {
             if (_updateClickArmed)
@@ -99,31 +101,52 @@ sealed class TrayContext : ApplicationContext
         };
         UpdateTooltip();
         RefreshAutostartCacheAsync();
-
         _hotkeyRetryTimer = new System.Windows.Forms.Timer { Interval = HotkeyRetryIntervalMs };
         _hotkeyRetryTimer.Tick += HotkeyRetryTick;
         UpdateHotkeyRegistration();
-
-        _pollTimer = new System.Windows.Forms.Timer { Interval = PollIntervalMs };
-        _pollTimer.Tick += PollTick;
-        _pollTimer.Start();
-
+        _fallbackTimer = new System.Windows.Forms.Timer { Interval = PollIntervalMs };
+        _fallbackTimer.Tick += (_, _) => OnPowerChanged();
+        _fallbackTimer.Start();
+        if (initialState is null)
+            RetryInitialState();
         try
         {
-            SystemEvents.SessionEnding += OnSessionEnding;
+            SystemEvents.SessionEnded += OnSessionEnded;
+            SystemEvents.PowerModeChanged += OnPowerModeChanged;
         }
         catch (Exception ex)
         {
             Program.LogError(ex);
         }
-
         try
         {
-            _ = Task.Delay(StartupUpdateDelayMs, _startupCts.Token).ContinueWith(t =>
+            var scheduler = SynchronizationContext.Current is not null
+                ? TaskScheduler.FromCurrentSynchronizationContext()
+                : TaskScheduler.Default;
+            _ = Task.Delay(StartupUpdateDelayMs, _shutdownToken).ContinueWith(t =>
             {
-                if (t.IsCanceled || _exiting || _disposed || !_autoUpdate)
+                if (t.IsCanceled || IsShuttingDown || !_autoUpdate)
                     return;
                 _ = CheckForUpdatesAsync(manual: false);
+            }, scheduler);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+        catch (Exception ex)
+        {
+            Program.LogError(ex);
+        }
+    }
+    void RetryInitialState()
+    {
+        try
+        {
+            _ = Task.Delay(InitialStateRetryDelayMs, _shutdownToken).ContinueWith(t =>
+            {
+                if (t.IsCanceled || IsShuttingDown)
+                    return;
+                OnPowerChanged();
             }, TaskScheduler.FromCurrentSynchronizationContext());
         }
         catch (OperationCanceledException)
@@ -134,11 +157,13 @@ sealed class TrayContext : ApplicationContext
             Program.LogError(ex);
         }
     }
-
-    void PollTick(object? sender, EventArgs e)
+    void OnPowerChanged()
     {
         try
         {
+            if (IsShuttingDown) return;
+            PowerApi.RefreshPowerSource();
+            PowerApi.InvalidateSchemeCacheForRefresh();
             var state = PowerApi.ReadState();
             if (state is { } value && value != _turboOn && !_applying)
             {
@@ -151,96 +176,112 @@ sealed class TrayContext : ApplicationContext
             Program.LogError(ex);
         }
     }
-
     void HotkeyRetryTick(object? sender, EventArgs e)
     {
-        if (_exiting || _disposed || !_hotkeyEnabled)
-        {
-            _hotkeyRetryTimer.Stop();
-            return;
-        }
-        if (Hotkeys.IsCopilot(_mods, _vk))
-        {
-            _hotkeyRetryTimer.Stop();
-            return;
-        }
-        if (_hotkeyWindow.Register(_mods, _vk))
-        {
-            _hotkeyRetryTimer.Stop();
-            Notify(Localization.Tr("hotkey_set") + " " + Hotkeys.DisplayName(_mods, _vk));
-            UpdateTooltip();
-            if (_icon.ContextMenuStrip is null || !_icon.ContextMenuStrip.Visible)
-                RebuildMenu();
-            else
-                UpdateChecks();
-            return;
-        }
-        if (--_hotkeyRetries <= 0)
-        {
-            _hotkeyRetryTimer.Stop();
-            _mods = _retryPrevMods;
-            _vk = _retryPrevVk;
-            _hotkeyEnabled = _retryPrevEnabled;
-            _config.Hotkey = _retryPrevEntry;
-            _config.HotkeyEnabled = _retryPrevEnabledCfg;
-            ConfigStore.Save(_config);
-            UpdateHotkeyRegistration(armRetry: false);
-            UpdateVisuals();
-            RefreshMenuSmart();
-            Notify(Localization.Tr("hotkey_failed"), important: true);
-        }
-    }
-
-    void OnHotkeyPressed()
-    {
-        if (_applying || _exiting)
-            return;
-        _ = ToggleAsync();
-    }
-
-    async Task ToggleAsync()
-    {
-        await SetStateAsync(!_turboOn).ConfigureAwait(true);
-    }
-
-    async Task SetStateAsync(bool on)
-    {
-        if (_applying || _exiting)
-            return;
-        _applying = true;
-        SetMenuEnabled(false);
         try
         {
-            var scheme = PowerApi.GetActiveScheme();
+            if (IsShuttingDown || !_hotkeyEnabled)
+            {
+                _hotkeyRetryTimer.Stop();
+                return;
+            }
+            if (Hotkeys.IsCopilot(_mods, _vk))
+            {
+                _hotkeyRetryTimer.Stop();
+                return;
+            }
+            if (_hotkeyWindow.Register(_mods, _vk))
+            {
+                _hotkeyRetryTimer.Stop();
+                NotifyHotkeySet(_mods, _vk);
+                UpdateTooltip();
+                UpdateChecks();
+                return;
+            }
+            if (--_hotkeyRetries <= 0)
+            {
+                _hotkeyRetryTimer.Stop();
+                bool isStartupRetry = _mods == _retryPrevMods && _vk == _retryPrevVk;
+                if (isStartupRetry)
+                {
+                    _hotkeyEnabled = false;
+                    _config.HotkeyEnabled = false;
+                    ConfigStore.RequestSave(_config);
+                    UpdateHotkeyRegistration(armRetry: false);
+                    UpdateVisuals();
+                    Notify(Localization.Tr("hotkey_failed"), important: true);
+                }
+                else
+                {
+                    _mods = _retryPrevMods;
+                    _vk = _retryPrevVk;
+                    _hotkeyEnabled = _retryPrevEnabled;
+                    _config.Hotkey = _retryPrevEntry;
+                    _config.HotkeyEnabled = _retryPrevEnabledCfg;
+                    ConfigStore.RequestSave(_config);
+                    UpdateHotkeyRegistration(armRetry: false);
+                    UpdateVisuals();
+                    Notify(Localization.Tr("hotkey_failed"), important: true);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Program.LogError(ex);
+            _hotkeyRetryTimer.Stop();
+        }
+    }
+    void OnHotkeyPressed()
+    {
+        try
+        {
+            if (_applying || _exiting)
+                return;
+            PostToUi(() => _ = ToggleAsync());
+        }
+        catch (Exception ex)
+        {
+            Program.LogError(ex);
+        }
+    }
+    Task ToggleAsync() => SetStateAsync(null);
+    internal static bool? ResolveTarget(bool? requested, bool? current) =>
+        requested ?? (current is { } state ? !state : null);
+    async Task SetStateAsync(bool? requested)
+    {
+        if (_applying || _exiting)
+            return;
+        try
+        {
+            _applying = true;
+            SetMenuEnabled(false);
+            PowerApi.RefreshPowerSource();
+            var scheme = PowerApi.GetActiveSchemeFresh();
             if (scheme is null)
             {
                 Notify(Localization.Tr("cannot_scheme"), important: true);
                 return;
             }
             var overlayBefore = PowerApi.GetActiveOverlay();
-
-            var currentState = PowerApi.ReadState();
-            if (currentState == on)
+            var target = ResolveTarget(requested, PowerApi.ReadState(scheme.Value, overlayBefore));
+            if (target is null)
             {
-                _turboOn = on;
-                UpdateVisuals();
-                Notify(Localization.Tr(on ? "turbo_enabled" : "turbo_disabled"));
+                Notify(Localization.Tr("cannot_confirm"), important: true);
                 return;
             }
+            bool on = target.Value;
             if (_exiting)
                 return;
-
-            uint value = on ? PowerApi.ResolveOnValue() : PowerApi.ValueOff;
-            var (acRc, dcRc) = PowerApi.WriteBoost(scheme.Value, value);
-            bool writeOk = acRc == 0 && dcRc == 0;
-
+            uint value = on ? PowerApi.ValueOn : PowerApi.ValueOff;
+            _ = PowerApi.WriteBoost(scheme.Value, value);
             uint? overlayRc = null;
+            bool overlayWriteOk = true;
             if (overlayBefore is not null)
             {
-                PowerApi.WriteBoost(overlayBefore.Value, value);
+                var (ovAc, ovDc) = PowerApi.WriteBoost(overlayBefore.Value, value);
+                overlayWriteOk = ovAc == 0 && ovDc == 0;
                 overlayRc = PowerApi.ActivateOverlay(overlayBefore.Value);
             }
-
             var current = PowerApi.GetActiveScheme();
             if (current is null)
             {
@@ -258,28 +299,32 @@ sealed class TrayContext : ApplicationContext
                 Notify(Localization.Tr("cannot_scheme"), important: true);
                 return;
             }
-
-            uint applyRc = PowerApi.ReapplyActiveScheme(scheme.Value);
-
+            _ = PowerApi.ReapplyActiveScheme(scheme.Value);
             bool? fast = PowerApi.ReadState();
             if (_exiting)
                 return;
-            bool applied = fast == on || await PowerApi.VerifyStateAsync(on).ConfigureAwait(true);
+            bool applied = await PowerApi.VerifyStateAsync(on, fast, ct: _shutdownToken);
             if (_exiting)
                 return;
-
-            var final = PowerApi.ReadState();
+            var currentAfter = PowerApi.GetActiveScheme();
+            var overlayAfter = PowerApi.GetActiveOverlay();
+            if (currentAfter is null || currentAfter.Value != scheme.Value
+                || overlayAfter != overlayBefore)
+            {
+                Notify(Localization.Tr("cannot_scheme"), important: true);
+                return;
+            }
+            var final = PowerApi.ReadState(currentAfter.Value, overlayAfter);
             if (final is not null)
                 _turboOn = final.Value;
             else if (applied)
                 _turboOn = on;
             UpdateVisuals();
-
             if (final is null)
                 Notify(Localization.Tr("cannot_confirm"), important: true);
-            else if (applied && writeOk && applyRc == 0)
-                Notify(Localization.Tr(_turboOn ? "turbo_enabled" : "turbo_disabled"));
-            else if (overlayBefore is not null && overlayRc == 0)
+            else if (final == on)
+                Notify(Localization.Tr(_turboOn ? "turbo_enabled" : "turbo_disabled"), skipRateLimit: true);
+            else if (overlayBefore is not null && overlayWriteOk && overlayRc == 0)
                 Notify(Localization.Tr("power_mode_override"));
             else
                 Notify(Localization.Tr("not_applied"), important: true);
@@ -301,33 +346,35 @@ sealed class TrayContext : ApplicationContext
                     RebuildMenu();
                 }
             }
-            else if (_exiting && _restoreOnExit && !_restored)
-            {
-                _restored = true;
-                RestoreBoostBestEffort();
-            }
+            else if (_exiting)
+                TryRestoreBoost();
         }
     }
-
     void SetMenuEnabled(bool enabled)
     {
         if (_disposed || _icon.ContextMenuStrip is null)
             return;
-        _enableItem.Enabled = enabled;
-        _disableItem.Enabled = enabled;
-        _hotkeyItem.Enabled = enabled;
-        _settingsItem.Enabled = enabled;
-        _autostartItem.Enabled = enabled && !_autostartBusy;
-        _checkNowItem.Enabled = enabled && !_checkingUpdates;
+        try
+        {
+            SetEnabled(_enableItem, enabled);
+            SetEnabled(_disableItem, enabled);
+            SetEnabled(_hotkeyItem, enabled);
+            SetEnabled(_settingsItem, enabled);
+            SetEnabled(_autostartItem, enabled && !_autostartBusy);
+            SetEnabled(_checkNowItem, enabled && !_checkingUpdates);
+        }
+        catch (Exception ex)
+        {
+            Program.LogError(ex);
+        }
     }
-
     void UpdateHotkeyRegistration(bool armRetry = true)
     {
         _hotkeyRetryTimer.Stop();
         _hotkeyRetries = 0;
         _hotkeyWindow.Unregister();
         _copilotHook.Uninstall();
-        if (!_hotkeyEnabled || _exiting || _disposed)
+        if (!_hotkeyEnabled || IsShuttingDown)
             return;
         if (Hotkeys.IsCopilot(_mods, _vk))
         {
@@ -340,7 +387,6 @@ sealed class TrayContext : ApplicationContext
                 _hotkeyEnabled, _config.HotkeyEnabled);
         }
     }
-
     void ArmHotkeyRetry(uint prevMods, uint prevVk, HotkeyEntry? prevEntry,
         bool prevEnabled, bool? prevEnabledCfg)
     {
@@ -349,97 +395,101 @@ sealed class TrayContext : ApplicationContext
         _retryPrevEntry = prevEntry;
         _retryPrevEnabled = prevEnabled;
         _retryPrevEnabledCfg = prevEnabledCfg;
-        _hotkeyRetries = 4;
+        _hotkeyRetries = MaxHotkeyRetries;
         _hotkeyRetryTimer.Start();
     }
-
-    void ApplyHotkey(uint mods, uint vk)
+    void ApplyHotkey(uint mods, uint vk, bool copilotKeyHeld = false)
     {
-        uint prevMods = _mods, prevVk = _vk;
-        var prevEntry = _config.Hotkey;
-        bool prevEnabled = _hotkeyEnabled;
-        bool? prevEnabledCfg = _config.HotkeyEnabled;
-        bool prevCopilot = Hotkeys.IsCopilot(prevMods, prevVk) && _copilotHook.IsInstalled;
-        _mods = mods;
-        _vk = vk;
-        _hotkeyEnabled = true;
-        bool ok;
-        bool retryArmed = false;
-        if (Hotkeys.IsCopilot(mods, vk))
+        try
         {
-            _hotkeyRetryTimer.Stop();
-            _hotkeyRetries = 0;
-            _hotkeyWindow.Unregister();
-            _copilotHook.Uninstall();
-            ok = _copilotHook.Install();
-        }
-        else
-        {
-            _copilotHook.Uninstall();
-            ok = _hotkeyWindow.Register(mods, vk);
-            if (ok)
+            uint prevMods = _mods, prevVk = _vk;
+            var prevEntry = _config.Hotkey;
+            bool prevEnabled = _hotkeyEnabled;
+            bool? prevEnabledCfg = _config.HotkeyEnabled;
+            bool prevCopilot = Hotkeys.IsCopilot(prevMods, prevVk) && _copilotHook.IsInstalled;
+            _mods = mods;
+            _vk = vk;
+            _hotkeyEnabled = true;
+            bool ok;
+            bool retryArmed = false;
+            if (Hotkeys.IsCopilot(mods, vk))
             {
                 _hotkeyRetryTimer.Stop();
                 _hotkeyRetries = 0;
-            }
-            else if (_hotkeyWindow.Current is null && !prevCopilot)
-            {
-                ArmHotkeyRetry(prevMods, prevVk, prevEntry, prevEnabled, prevEnabledCfg);
-                retryArmed = true;
+                _hotkeyWindow.Unregister();
+                _copilotHook.Uninstall();
+                ok = _copilotHook.Install();
+                if (ok && copilotKeyHeld)
+                    _copilotHook.IgnoreUntilKeyUp();
             }
             else
             {
-                _hotkeyRetryTimer.Stop();
+                _copilotHook.Uninstall();
+                ok = _hotkeyWindow.Register(mods, vk);
+                if (ok)
+                {
+                    _hotkeyRetryTimer.Stop();
+                    _hotkeyRetries = 0;
+                }
+                else if (_hotkeyWindow.Current is null && !prevCopilot)
+                {
+                    ArmHotkeyRetry(prevMods, prevVk, prevEntry, prevEnabled, prevEnabledCfg);
+                    retryArmed = true;
+                }
+                else
+                {
+                    _hotkeyRetryTimer.Stop();
+                }
             }
+            if (!ok && !retryArmed)
+            {
+                _mods = prevMods;
+                _vk = prevVk;
+                _hotkeyEnabled = prevEnabled;
+                _config.Hotkey = prevEntry;
+                _config.HotkeyEnabled = prevEnabledCfg;
+                UpdateHotkeyRegistration();
+            }
+            else
+            {
+                _config.Hotkey = new HotkeyEntry(mods, vk);
+                _config.HotkeyEnabled = true;
+            }
+            ConfigStore.RequestSave(_config);
+            UpdateVisuals();
+            if (ok)
+                NotifyHotkeySet(mods, vk);
+            else
+                Notify(Localization.Tr(Hotkeys.IsCopilot(mods, vk) ? "hotkey_failed" : "hotkey_busy"), important: true);
         }
-        if (!ok && !retryArmed)
+        catch (Exception ex)
         {
-            _mods = prevMods;
-            _vk = prevVk;
-            _hotkeyEnabled = prevEnabled;
-            _config.Hotkey = prevEntry;
-            _config.HotkeyEnabled = prevEnabledCfg;
-            UpdateHotkeyRegistration();
+            Program.LogError(ex);
         }
-        else
-        {
-            _config.Hotkey = new HotkeyEntry(mods, vk);
-            _config.HotkeyEnabled = true;
-        }
-        ConfigStore.Save(_config);
-        UpdateVisuals();
-        RefreshMenuSmart();
-        if (ok)
-            Notify(Localization.Tr("hotkey_set") + " " + Hotkeys.DisplayName(mods, vk));
-        else
-            Notify(Localization.Tr(Hotkeys.IsCopilot(mods, vk) ? "hotkey_failed" : "hotkey_busy"), important: true);
     }
-
-    void RefreshMenuSmart()
-    {
-        if (_icon.ContextMenuStrip is null || !_icon.ContextMenuStrip.Visible)
-            RebuildMenu();
-        else
-            UpdateChecks();
-    }
-
     void SetHotkeyEnabled(bool on)
     {
-        _hotkeyEnabled = on;
-        _config.HotkeyEnabled = on;
-        ConfigStore.Save(_config);
-        UpdateHotkeyRegistration();
-        UpdateVisuals();
-        RebuildMenu();
-        if (on)
-            Notify(Localization.Tr("hotkey_set") + " " + Hotkeys.DisplayName(_mods, _vk));
-        else
-            Notify(Localization.Tr("hotkey_disabled"));
+        try
+        {
+            _hotkeyEnabled = on;
+            _config.HotkeyEnabled = on;
+            ConfigStore.RequestSave(_config);
+            UpdateHotkeyRegistration();
+            UpdateVisuals();
+            if (on)
+                NotifyHotkeySet(_mods, _vk);
+            else
+                Notify(Localization.Tr("hotkey_disabled"));
+        }
+        catch (Exception ex)
+        {
+            Program.LogError(ex);
+        }
     }
-
     void CaptureCustomHotkey()
     {
         bool resumeRetry = _hotkeyRetryTimer.Enabled;
+        int savedRetries = _hotkeyRetries;
         _hotkeyRetryTimer.Stop();
         _copilotHook.Suspended = true;
         _hotkeyWindow.Unregister();
@@ -451,7 +501,11 @@ sealed class TrayContext : ApplicationContext
             if (form.Result is { } combo)
             {
                 applied = true;
-                ApplyHotkey(combo.Mods, combo.Vk);
+                ApplyHotkey(combo.Mods, combo.Vk, copilotKeyHeld: form.CopilotKeyHeld);
+            }
+            else if (form.HookFailed)
+            {
+                Notify(Localization.Tr("hotkey_failed"), important: true);
             }
             else if (!form.UserCancelled)
             {
@@ -462,88 +516,128 @@ sealed class TrayContext : ApplicationContext
         {
             _copilotHook.Suspended = false;
             if (!applied)
-                UpdateHotkeyRegistration();
-            if (resumeRetry && _hotkeyEnabled && _hotkeyWindow.Current is null && _hotkeyRetries > 0 && !_exiting && !_disposed)
+            {
+                if (resumeRetry)
+                {
+                    _hotkeyRetries = savedRetries;
+                    _hotkeyRetryTimer.Start();
+                }
+                else
+                {
+                    UpdateHotkeyRegistration();
+                }
+            }
+            if (resumeRetry && !_hotkeyRetryTimer.Enabled && _hotkeyEnabled
+                && _hotkeyWindow.Current is null && _hotkeyRetries > 0 && !_exiting && !_disposed)
                 _hotkeyRetryTimer.Start();
         }
     }
-
     void SetLanguage(string code)
     {
-        if (!Localization.IsSupported(code) || Localization.Language == code)
-            return;
-        Localization.Language = code;
-        _config.Lang = code;
-        ConfigStore.Save(_config);
-        UpdateVisuals();
-        RebuildMenu();
+        try
+        {
+            if (!Localization.IsSupported(code) || Localization.Language == code)
+                return;
+            Localization.Language = code;
+            _config.Lang = code;
+            ConfigStore.RequestSave(_config);
+            UpdateVisuals();
+            RebuildMenu();
+        }
+        catch (Exception ex)
+        {
+            Program.LogError(ex);
+        }
     }
-
+    void TryRestoreBoost()
+    {
+        if (_restoreOnExit && Interlocked.Exchange(ref _restored, 1) == 0)
+            RestoreBoostBestEffort();
+    }
+    void NotifyHotkeySet(uint mods, uint vk) =>
+        Notify($"{Localization.Tr("hotkey_set")} {Hotkeys.DisplayName(mods, vk)}");
+    void ToggleBool(bool current, Action<bool> configSetter, Action<bool> fieldSetter)
+    {
+        try
+        {
+            bool value = !current;
+            fieldSetter(value);
+            configSetter(value);
+            ConfigStore.RequestSave(_config);
+            UpdateChecks();
+        }
+        catch (Exception ex)
+        {
+            Program.LogError(ex);
+        }
+    }
+    void ToggleRestoreOnExit()
+    {
+        try
+        {
+            bool value = !_restoreOnExit;
+            _restoreOnExit = value;
+            _config.RestoreOnExit = value;
+            ConfigStore.RequestSave(_config);
+            UpdateChecks();
+        }
+        catch (Exception ex)
+        {
+            Program.LogError(ex);
+        }
+    }
+    void ToggleNotifications() => ToggleBool(_notifications, v => _config.Notifications = v, val => _notifications = val);
+    void ToggleAutoUpdate() => ToggleBool(_autoUpdate, v => _config.AutoUpdateCheck = v, val => _autoUpdate = val);
     void ToggleAutostart()
     {
         if (_autostartBusy)
             return;
         _autostartBusy = true;
-        _autostartItem.Enabled = false;
+        SetEnabled(_autostartItem, false);
         int seq = ++_autostartSeq;
-        bool target = !_autostartCached;
-        Task.Run(() => Autostart.SetEnabled(target)).ContinueWith(t =>
+        try
         {
-            if (_exiting || _disposed || seq != _autostartSeq)
-                return;
+            Task.Run(() =>
+            {
+                bool target = !Autostart.IsEnabled();
+                return (Target: target, Ok: Autostart.SetEnabled(target));
+            }).ContinueWith(t =>
+            {
+                if (IsShuttingDown || seq != _autostartSeq)
+                    return;
+                _autostartBusy = false;
+                if (t.IsCompletedSuccessfully && t.Result.Ok)
+                {
+                    _lastAutostartCheckTicks = Environment.TickCount64;
+                    _autostartCached = t.Result.Target;
+                    Notify(Localization.Tr(t.Result.Target ? "autostart_on" : "autostart_off"));
+                }
+                else
+                {
+                    _lastAutostartCheckTicks = ExpiredTicks;
+                    Notify(Localization.Tr("autostart_error"), important: true);
+                }
+                UpdateChecks();
+            }, TaskScheduler.FromCurrentSynchronizationContext());
+        }
+        catch (Exception ex)
+        {
             _autostartBusy = false;
-            _lastAutostartCheck = DateTime.UtcNow;
-            bool ok = t.IsCompletedSuccessfully && t.Result;
-            if (ok)
-            {
-                _autostartCached = target;
-                Notify(Localization.Tr(target ? "autostart_on" : "autostart_off"));
-            }
-            else
-            {
-                Notify(Localization.Tr("autostart_error"), important: true);
-            }
             UpdateChecks();
-            if (_icon.ContextMenuStrip is not null)
-                _autostartItem.Enabled = true;
-        }, TaskScheduler.FromCurrentSynchronizationContext());
+            Program.LogError(ex);
+        }
     }
-
-    void ToggleRestoreOnExit()
-    {
-        _restoreOnExit = !_restoreOnExit;
-        _config.RestoreOnExit = _restoreOnExit;
-        ConfigStore.Save(_config);
-        UpdateChecks();
-    }
-
-    void ToggleNotifications()
-    {
-        _notifications = !_notifications;
-        _config.Notifications = _notifications;
-        ConfigStore.Save(_config);
-        UpdateChecks();
-    }
-
-    void ToggleAutoUpdate()
-    {
-        _autoUpdate = !_autoUpdate;
-        _config.AutoUpdateCheck = _autoUpdate;
-        ConfigStore.Save(_config);
-        UpdateChecks();
-    }
-
     async Task CheckForUpdatesAsync(bool manual)
     {
-        if (_checkingUpdates || _exiting || _disposed)
+        if (_checkingUpdates || IsShuttingDown)
             return;
         _checkingUpdates = true;
         if (!_exiting && !_disposed && _icon.ContextMenuStrip is not null)
-            _checkNowItem.Enabled = false;
+            SetEnabled(_checkNowItem, false);
         try
         {
-            var result = await Updater.CheckAsync(_startupCts.Token).ConfigureAwait(true);
-            if (_exiting || _disposed)
+            var result = await Updater.CheckAsync(_shutdownToken);
+            if (IsShuttingDown)
                 return;
             if (result.Status == Updater.Status.Available)
             {
@@ -563,7 +657,7 @@ sealed class TrayContext : ApplicationContext
                     _updateClickArmedFor = result.Tag;
                     _updateClickArmed = true;
                     Notify(Localization.Tr("update_available") + " " + result.Tag,
-                        important: true, updateBalloon: true);
+                        updateBalloon: true);
                 }
             }
             else
@@ -604,21 +698,18 @@ sealed class TrayContext : ApplicationContext
         finally
         {
             _checkingUpdates = false;
-            if (!_exiting && !_disposed && _icon.ContextMenuStrip is not null)
-                _checkNowItem.Enabled = true;
+            UpdateChecks();
         }
     }
-
     void OpenUpdatePage()
     {
         if (_updateUrl != "")
             OpenUrl(_updateUrl);
     }
-
     static void OpenUrl(string url)
     {
         if (!Uri.TryCreate(url, UriKind.Absolute, out var uri)
-            || (uri.Scheme != "http" && uri.Scheme != "https"))
+            || uri.Scheme != Uri.UriSchemeHttps)
             return;
         try
         {
@@ -631,17 +722,15 @@ sealed class TrayContext : ApplicationContext
             Program.LogError(ex);
         }
     }
-
     static void RestoreBoostBestEffort()
     {
         try
         {
-            if (PowerApi.ReadState() == true)
-                return;
-            var scheme = PowerApi.GetActiveScheme();
+            PowerApi.RefreshPowerSource();
+            var scheme = PowerApi.GetActiveSchemeFresh();
             if (scheme is null)
                 return;
-            uint value = PowerApi.ResolveOnValue();
+            uint value = PowerApi.ValueOn;
             PowerApi.WriteBoost(scheme.Value, value);
             var overlay = PowerApi.GetActiveOverlay();
             if (overlay is not null)
@@ -654,38 +743,49 @@ sealed class TrayContext : ApplicationContext
                 return;
             PowerApi.ReapplyActiveScheme(scheme.Value);
         }
-        catch (Exception ex) when (ex is not StackOverflowException && ex is not OutOfMemoryException)
+        catch (Exception ex)
         {
             Program.LogError(ex);
         }
     }
     void RefreshAutostartCacheAsync(bool force = false)
     {
-        if (!force && (DateTime.UtcNow - _lastAutostartCheck).TotalSeconds < AutostartCacheTtlSeconds)
+        if (_autostartBusy)
+            return;
+        if (!force && AgeMs(_lastAutostartCheckTicks) < AutostartCacheTtlMs)
             return;
         int seq = _autostartSeq;
-        Task.Run(() => Autostart.IsEnabled()).ContinueWith(t =>
+        try
         {
-            if (_exiting || _disposed || seq != _autostartSeq || _autostartBusy)
-                return;
-            if (!t.IsCompletedSuccessfully)
-                return;
-            _lastAutostartCheck = DateTime.UtcNow;
-            _autostartCached = t.Result;
-            UpdateChecks();
-        }, TaskScheduler.FromCurrentSynchronizationContext());
+            Task.Run(() => Autostart.IsEnabled()).ContinueWith(t =>
+            {
+                if (IsShuttingDown || seq != _autostartSeq || _autostartBusy)
+                    return;
+                if (!t.IsCompletedSuccessfully)
+                    return;
+                _lastAutostartCheckTicks = Environment.TickCount64;
+                _autostartCached = t.Result;
+                UpdateChecks();
+            }, TaskScheduler.FromCurrentSynchronizationContext());
+        }
+        catch (Exception ex)
+        {
+            Program.LogError(ex);
+        }
     }
-
-    void Notify(string message, bool important = false, bool updateBalloon = false)
+    void Notify(string message, bool important = false, bool updateBalloon = false, bool skipRateLimit = false)
     {
         if (!updateBalloon)
             _updateClickArmed = false;
         if ((!_notifications && !important) || _exiting || !_icon.Visible)
             return;
-        if (!important && (DateTime.UtcNow - _lastBalloon).TotalSeconds < BalloonRateLimitSeconds)
+        long age = AgeMs(_lastBalloonTicks);
+        if (!important && !skipRateLimit && age < BalloonRateLimitMs)
             return;
-        if (!important)
-            _lastBalloon = DateTime.UtcNow;
+        if ((important || skipRateLimit) && message == _lastBalloonText && age < ImportantBalloonRepeatMs)
+            return;
+        _lastBalloonTicks = Environment.TickCount64;
+        _lastBalloonText = message;
         try
         {
             _icon.ShowBalloonTip(0, Program.AppName, message, ToolTipIcon.Info);
@@ -695,100 +795,174 @@ sealed class TrayContext : ApplicationContext
             Program.LogError(ex);
         }
     }
-
-    void OnSessionEnding(object sender, SessionEndingEventArgs e)
+    void OnSessionEnded(object sender, SessionEndedEventArgs e)
     {
-        if (_exiting)
+        if (IsShuttingDown)
             return;
         _exiting = true;
-        _pollTimer.Stop();
+        TryRestoreBoost();
+        PostToUi(SessionEndedCleanup);
+    }
+    void SessionEndedCleanup()
+    {
+        if (_disposed)
+            return;
         try
         {
-            if (_restoreOnExit && !_restored)
-            {
-                _restored = true;
-                RestoreBoostBestEffort();
-            }
+            _fallbackTimer.Stop();
+            ConfigStore.FlushPending();
+            Application.Exit();
         }
         catch (Exception ex)
         {
             Program.LogError(ex);
         }
     }
-
+    void OnPowerModeChanged(object sender, PowerModeChangedEventArgs e)
+    {
+        if (IsShuttingDown)
+            return;
+        PostToUi(OnPowerChanged);
+    }
+    void PostToUi(Action action)
+    {
+        var ui = _ui;
+        if (ui is null)
+        {
+            try { action(); }
+            catch (Exception ex) { Program.LogError(ex); }
+            return;
+        }
+        try { ui.Post(_ => action(), null); }
+        catch (Exception ex) { Program.LogError(ex); }
+    }
     void ExitApp()
     {
         if (_exiting)
             return;
         _exiting = true;
-        _pollTimer.Stop();
-        _hotkeyRetryTimer.Stop();
-        _hotkeyWindow.HotkeyPressed -= OnHotkeyPressed;
-        _copilotHook.Pressed -= OnHotkeyPressed;
-        _copilotHook.Uninstall();
         try
         {
-            if (_restoreOnExit && !_restored)
+            _fallbackTimer.Stop();
+            _hotkeyRetryTimer.Stop();
+            ConfigStore.FlushPending();
+            _hotkeyWindow.HotkeyPressed -= OnHotkeyPressed;
+            _copilotHook.Pressed -= OnHotkeyPressed;
+            _copilotHook.Uninstall();
+            try { TryRestoreBoost(); }
+            finally
             {
-                _restored = true;
-                RestoreBoostBestEffort();
+                _icon.Visible = false;
+                Application.Exit();
             }
         }
-        finally
+        catch (Exception ex)
         {
-            _icon.Visible = false;
-            Application.Exit();
+            Program.LogError(ex);
+            try { _icon.Visible = false; } catch { }
+            try { Application.Exit(); } catch { }
         }
     }
-
     void UpdateVisuals()
     {
-        var icon = IconFactory.Get(_turboOn);
-        if (!ReferenceEquals(_icon.Icon, icon))
-            _icon.Icon = icon;
-        UpdateTooltip();
-        UpdateChecks();
+        try
+        {
+            var icon = IconFactory.Get(_turboOn);
+            if (!ReferenceEquals(_icon.Icon, icon))
+                _icon.Icon = icon;
+            UpdateTooltip();
+            UpdateChecks();
+        }
+        catch (Exception ex)
+        {
+            Program.LogError(ex);
+        }
     }
-
+    bool _tooltipCached;
+    bool _tipOn, _tipHotkeyEnabled;
+    uint _tipMods, _tipVk;
+    string _tipLang = "";
+    string _tipText = "";
     void UpdateTooltip()
     {
+        if (_tooltipCached && _tipOn == _turboOn && _tipHotkeyEnabled == _hotkeyEnabled
+            && _tipMods == _mods && _tipVk == _vk && _tipLang == Localization.Language)
+        {
+            if (_icon.Text != _tipText)
+                _icon.Text = _tipText;
+            return;
+        }
         string hk = _hotkeyEnabled ? Hotkeys.DisplayName(_mods, _vk) : Localization.Tr("disabled");
         var text = TruncateTooltip(Localization.Tr(_turboOn ? "status_on" : "status_off") + " [" + hk + "]");
+        _tooltipCached = true;
+        _tipOn = _turboOn;
+        _tipHotkeyEnabled = _hotkeyEnabled;
+        _tipMods = _mods;
+        _tipVk = _vk;
+        _tipLang = Localization.Language;
+        _tipText = text;
         if (_icon.Text != text)
             _icon.Text = text;
     }
+    internal const int TooltipMaxLength = 127;
 
     internal static string TruncateTooltip(string text)
     {
-        const int max = 127;
+        const int max = TooltipMaxLength;
         if (text.Length <= max)
             return text;
-        int len = char.IsHighSurrogate(text[max - 2]) ? max - 2 : max - 1;
+        int len = max - 1;
+        if (char.IsHighSurrogate(text[len - 1]) && len < text.Length && char.IsLowSurrogate(text[len]))
+            len--;
+        while (len > 0 && char.GetUnicodeCategory(text[len - 1])
+            is System.Globalization.UnicodeCategory.NonSpacingMark
+            or System.Globalization.UnicodeCategory.SpacingCombiningMark
+            or System.Globalization.UnicodeCategory.EnclosingMark)
+            len--;
+        if (len <= 0)
+            len = max - 1;
         return text[..len] + "\u2026";
     }
-
     void UpdateChecks()
     {
         if (_disposed || _exiting || _icon.ContextMenuStrip is null)
             return;
-        _enableItem.Checked = _turboOn;
-        _disableItem.Checked = !_turboOn;
-        _autostartItem.Checked = _autostartCached;
-        _autostartItem.Enabled = !_autostartBusy && !_applying;
-        _restoreItem.Checked = _restoreOnExit;
-        _notificationsItem.Checked = _notifications;
-        _autoUpdateItem.Checked = _autoUpdate;
-        _checkNowItem.Enabled = !_checkingUpdates && !_applying;
-        _hotkeyOffItem.Checked = !_hotkeyEnabled;
-        foreach (var (item, mods, vk) in _presetItems)
-            item.Checked = _hotkeyEnabled && _mods == mods && _vk == vk;
-        foreach (var (code, item) in _langItems)
-            item.Checked = Localization.Language == code;
+        try
+        {
+            SetChecked(_enableItem, _turboOn);
+            SetChecked(_disableItem, !_turboOn);
+            SetChecked(_autostartItem, _autostartCached);
+            SetEnabled(_autostartItem, !_autostartBusy && !_applying);
+            SetChecked(_restoreItem, _restoreOnExit);
+            SetChecked(_notificationsItem, _notifications);
+            SetChecked(_autoUpdateItem, _autoUpdate);
+            SetEnabled(_checkNowItem, !_checkingUpdates && !_applying);
+            SetChecked(_hotkeyOffItem, !_hotkeyEnabled);
+            foreach (var (item, mods, vk) in _presetItems)
+                SetChecked(item, _hotkeyEnabled && _mods == mods && _vk == vk);
+            foreach (var (code, item) in _langItems)
+                SetChecked(item, Localization.Language == code);
+        }
+        catch (Exception ex)
+        {
+            Program.LogError(ex);
+        }
     }
-
+    static void SetChecked(ToolStripMenuItem? item, bool value)
+    {
+        if (item is null || item.Checked == value)
+            return;
+        item.Checked = value;
+    }
+    static void SetEnabled(ToolStripMenuItem? item, bool value)
+    {
+        if (item is null || item.Enabled == value)
+            return;
+        item.Enabled = value;
+    }
     void RebuildMenu()
     {
-        if (_exiting || _disposed)
+        if (IsShuttingDown)
         {
             UpdateChecks();
             return;
@@ -799,172 +973,194 @@ sealed class TrayContext : ApplicationContext
             UpdateChecks();
             return;
         }
-        var old = _icon.ContextMenuStrip;
-        if (old is { Visible: true })
+        try
         {
-            if (!_rebuildOnMenuClose)
+            var old = _icon.ContextMenuStrip;
+            if (old is { Visible: true })
             {
-                _rebuildOnMenuClose = true;
-                old.Closed += OnMenuClosedForRebuild;
+                if (!_rebuildOnMenuClose)
+                {
+                    _rebuildOnMenuClose = true;
+                    old.Closed += OnMenuClosedForRebuild;
+                }
+                return;
             }
-            return;
+            var next = BuildMenu();
+            if (next is null)
+                return;
+            _icon.ContextMenuStrip = next;
+            old?.Dispose();
         }
-        _icon.ContextMenuStrip = BuildMenu();
-        old?.Dispose();
-        UpdateChecks();
+        catch (Exception ex)
+        {
+            Program.LogError(ex);
+        }
     }
-
     void OnMenuClosedForRebuild(object? sender, ToolStripDropDownClosedEventArgs e)
     {
         if (sender is ContextMenuStrip menu)
             menu.Closed -= OnMenuClosedForRebuild;
         _rebuildOnMenuClose = false;
-        if (_exiting || _disposed)
+        if (IsShuttingDown)
             return;
-        RebuildMenu();
+        try { RebuildMenu(); }
+        catch (Exception ex) { Program.LogError(ex); }
     }
-
     readonly List<(ToolStripMenuItem item, uint mods, uint vk)> _presetItems = new();
     readonly Dictionary<string, ToolStripMenuItem> _langItems = new();
+    ContextMenuStrip? BuildMenu()
+    {
+        ContextMenuStrip? menu = null;
+        try
+        {
+            var presets = new List<(ToolStripMenuItem item, uint mods, uint vk)>();
+            var langs = new Dictionary<string, ToolStripMenuItem>();
+            var enableItem = new ToolStripMenuItem(Localization.Tr("enable")) { Checked = _turboOn };
+            enableItem.Click += async (_, _) => await SetStateAsync(true);
+            var disableItem = new ToolStripMenuItem(Localization.Tr("disable")) { Checked = !_turboOn };
+            disableItem.Click += async (_, _) => await SetStateAsync(false);
+            var settingsItem = new ToolStripMenuItem(Localization.Tr("settings"));
+            var settings = BuildSettingsItems(langs);
+            settingsItem.DropDownItems.AddRange(settings.Items);
+            var (hotkeyItem, hotkeyOffItem) = BuildHotkeyMenu(presets);
+            var exit = new ToolStripMenuItem(Localization.Tr("exit"));
+            exit.Click += (_, _) => ExitApp();
+            menu = new ContextMenuStrip();
+            menu.Items.AddRange([
+                new ToolStripMenuItem(Program.Title) { Enabled = false },
+                new ToolStripSeparator(),
+                enableItem,
+                disableItem,
+                new ToolStripSeparator(),
+                hotkeyItem,
+                settingsItem,
+                BuildDonateMenu(),
+                new ToolStripSeparator(),
+                exit,
+            ]);
+            menu.Opening += OnMenuOpening;
+            settingsItem.DropDown.Opening += (_, _) => RefreshAutostartCacheAsync();
 
-    ContextMenuStrip BuildMenu()
+            _presetItems.Clear();
+            _presetItems.AddRange(presets);
+            _langItems.Clear();
+            foreach (var (code, item) in langs)
+                _langItems[code] = item;
+            _enableItem = enableItem;
+            _disableItem = disableItem;
+            _settingsItem = settingsItem;
+            _hotkeyItem = hotkeyItem;
+            _hotkeyOffItem = hotkeyOffItem;
+            _autostartItem = settings.Autostart;
+            _restoreItem = settings.Restore;
+            _notificationsItem = settings.Notifications;
+            _autoUpdateItem = settings.AutoUpdate;
+            _checkNowItem = settings.CheckNow;
+            if (_applying) SetMenuEnabled(false);
+            return menu;
+        }
+        catch (Exception ex)
+        {
+            Program.LogError(ex);
+            try { menu?.Dispose(); } catch { }
+            return null;
+        }
+    }
+    ContextMenuStrip FallbackMenu()
     {
         var menu = new ContextMenuStrip();
-        _presetItems.Clear();
-        _langItems.Clear();
-
-        var title = new ToolStripMenuItem(Program.Title) { Enabled = false };
-
-        _enableItem = new ToolStripMenuItem(Localization.Tr("enable")) { Checked = _turboOn };
-        _enableItem.Click += async (_, _) => await SetStateAsync(true).ConfigureAwait(true);
-
-        _disableItem = new ToolStripMenuItem(Localization.Tr("disable")) { Checked = !_turboOn };
-        _disableItem.Click += async (_, _) => await SetStateAsync(false).ConfigureAwait(true);
-
-        _settingsItem = new ToolStripMenuItem(Localization.Tr("settings"));
-
-        _autostartItem = new ToolStripMenuItem(Localization.Tr("autostart"))
-        {
-            Checked = _autostartCached,
-            Enabled = !_autostartBusy,
-        };
-        _autostartItem.Click += (_, _) => ToggleAutostart();
-
-        var hotkeyItem = _hotkeyItem = new ToolStripMenuItem(Localization.Tr("hotkey"));
+        var exit = new ToolStripMenuItem(Localization.Tr("exit"));
+        exit.Click += (_, _) => ExitApp();
+        menu.Items.AddRange([
+            new ToolStripMenuItem(Program.Title) { Enabled = false },
+            new ToolStripSeparator(),
+            exit,
+        ]);
+        return menu;
+    }
+    void OnMenuOpening(object? sender, CancelEventArgs e)
+    {
+        UpdateChecks();
+        RefreshAutostartCacheAsync();
+    }
+    (ToolStripMenuItem Item, ToolStripMenuItem Off) BuildHotkeyMenu(
+        List<(ToolStripMenuItem item, uint mods, uint vk)> presets)
+    {
+        var hotkeyItem = new ToolStripMenuItem(Localization.Tr("hotkey"));
         foreach (var (label, mods, vk) in Hotkeys.Presets)
         {
             var item = new ToolStripMenuItem(label) { Checked = _hotkeyEnabled && _mods == mods && _vk == vk };
             item.Click += (_, _) => ApplyHotkey(mods, vk);
             hotkeyItem.DropDownItems.Add(item);
-            _presetItems.Add((item, mods, vk));
+            presets.Add((item, mods, vk));
         }
         var custom = new ToolStripMenuItem(Localization.Tr("custom"));
         custom.Click += (_, _) => CaptureCustomHotkey();
         hotkeyItem.DropDownItems.Add(custom);
         hotkeyItem.DropDownItems.Add(new ToolStripSeparator());
-        _hotkeyOffItem = new ToolStripMenuItem(Localization.Tr("disabled"))
+        var offItem = new ToolStripMenuItem(Localization.Tr("disabled")) { Checked = !_hotkeyEnabled };
+        offItem.Click += (_, _) => SetHotkeyEnabled(!_hotkeyEnabled);
+        hotkeyItem.DropDownItems.Add(offItem);
+        return (hotkeyItem, offItem);
+    }
+    (ToolStripItem[] Items, ToolStripMenuItem Autostart, ToolStripMenuItem Restore,
+        ToolStripMenuItem Notifications, ToolStripMenuItem AutoUpdate, ToolStripMenuItem CheckNow)
+        BuildSettingsItems(Dictionary<string, ToolStripMenuItem> langItems)
+    {
+        var autostartItem = new ToolStripMenuItem(Localization.Tr("autostart"))
         {
-            Checked = !_hotkeyEnabled,
+            Checked = _autostartCached,
+            Enabled = !_autostartBusy,
         };
-        _hotkeyOffItem.Click += (_, _) => SetHotkeyEnabled(!_hotkeyEnabled);
-        hotkeyItem.DropDownItems.Add(_hotkeyOffItem);
-
-        _restoreItem = new ToolStripMenuItem(Localization.Tr("restore_on_exit"))
-        {
-            Checked = _restoreOnExit,
-        };
-        _restoreItem.Click += (_, _) => ToggleRestoreOnExit();
-
-        _notificationsItem = new ToolStripMenuItem(Localization.Tr("notifications"))
-        {
-            Checked = _notifications,
-        };
-        _notificationsItem.Click += (_, _) => ToggleNotifications();
-
-        _autoUpdateItem = new ToolStripMenuItem(Localization.Tr("auto_update_check"))
-        {
-            Checked = _autoUpdate,
-        };
-        _autoUpdateItem.Click += (_, _) => ToggleAutoUpdate();
-
-        _checkNowItem = new ToolStripMenuItem(Localization.Tr("check_updates"))
-        {
-            Enabled = !_checkingUpdates,
-        };
-        _checkNowItem.Click += (_, _) => _ = CheckForUpdatesAsync(manual: true);
-
+        autostartItem.Click += (_, _) => ToggleAutostart();
+        var restoreItem = new ToolStripMenuItem(Localization.Tr("restore_on_exit")) { Checked = _restoreOnExit };
+        restoreItem.Click += (_, _) => ToggleRestoreOnExit();
+        var notificationsItem = new ToolStripMenuItem(Localization.Tr("notifications")) { Checked = _notifications };
+        notificationsItem.Click += (_, _) => ToggleNotifications();
+        var autoUpdateItem = new ToolStripMenuItem(Localization.Tr("auto_update_check")) { Checked = _autoUpdate };
+        autoUpdateItem.Click += (_, _) => ToggleAutoUpdate();
+        var checkNowItem = new ToolStripMenuItem(Localization.Tr("check_updates")) { Enabled = !_checkingUpdates };
+        checkNowItem.Click += (_, _) => _ = CheckForUpdatesAsync(manual: true);
         var langItem = new ToolStripMenuItem(Localization.Tr("language"));
         foreach (var code in Localization.AllLangs)
         {
-            var item = new ToolStripMenuItem(Localization.LangName(code))
-            {
-                Checked = Localization.Language == code,
-            };
+            var item = new ToolStripMenuItem(Localization.LangName(code)) { Checked = Localization.Language == code };
             item.Click += (_, _) => SetLanguage(code);
             langItem.DropDownItems.Add(item);
-            _langItems[code] = item;
+            langItems[code] = item;
         }
-
-        _settingsItem.DropDownItems.AddRange(new ToolStripItem[]
-        {
-            _autostartItem,
+        ToolStripItem[] items =
+        [
+            autostartItem,
             new ToolStripSeparator(),
             langItem,
             new ToolStripSeparator(),
-            _restoreItem,
-            _notificationsItem,
+            restoreItem,
+            notificationsItem,
             new ToolStripSeparator(),
-            _autoUpdateItem,
-            _checkNowItem,
-        });
-
-        var exit = new ToolStripMenuItem(Localization.Tr("exit"));
-        exit.Click += (_, _) => ExitApp();
-
-        var githubDonate = new ToolStripMenuItem(Localization.Tr("github_donate"));
-        var githubItem = new ToolStripMenuItem("GitHub");
-        githubItem.Click += (_, _) => OpenUrl("https://github.com/vornixbit/CPU-TurboBoost-Toggle");
-        var patreonItem = new ToolStripMenuItem("Patreon");
-        patreonItem.Click += (_, _) => OpenUrl("https://www.patreon.com/vornixbit");
-        var kofiItem = new ToolStripMenuItem("Ko-fi");
-        kofiItem.Click += (_, _) => OpenUrl("https://ko-fi.com/vornixbit");
-        var paypalItem = new ToolStripMenuItem("PayPal");
-        paypalItem.Click += (_, _) => OpenUrl("https://www.paypal.com/ncp/payment/KZPBTMMCPVU3U");
-        githubDonate.DropDownItems.AddRange(new ToolStripItem[]
-        {
-            githubItem,
-            new ToolStripSeparator(),
-            patreonItem,
-            kofiItem,
-            paypalItem,
-        });
-
-        menu.Items.AddRange(new ToolStripItem[]
-        {
-            title,
-            new ToolStripSeparator(),
-            _enableItem,
-            _disableItem,
-            new ToolStripSeparator(),
-            hotkeyItem,
-            _settingsItem,
-            githubDonate,
-            new ToolStripSeparator(),
-            exit,
-        });
-
-        menu.Opening += (_, _) =>
-        {
-            UpdateChecks();
-            RefreshAutostartCacheAsync();
-        };
-
-        if (_applying)
-            SetMenuEnabled(false);
-
-        return menu;
+            autoUpdateItem,
+            checkNowItem,
+        ];
+        return (items, autostartItem, restoreItem, notificationsItem, autoUpdateItem, checkNowItem);
     }
-
+    static ToolStripMenuItem BuildDonateMenu()
+    {
+        var donate = new ToolStripMenuItem(Localization.Tr("github_donate"));
+        donate.DropDownItems.AddRange([
+            CreateLink("GitHub", "https://github.com/vornixbit/CPU-TurboBoost-Toggle"),
+            new ToolStripSeparator(),
+            CreateLink("Patreon", "https://www.patreon.com/vornixbit"),
+            CreateLink("Ko-fi", "https://ko-fi.com/vornixbit"),
+            CreateLink("PayPal", "https://www.paypal.com/ncp/payment/KZPBTMMCPVU3U"),
+        ]);
+        return donate;
+        static ToolStripMenuItem CreateLink(string label, string url)
+        {
+            var item = new ToolStripMenuItem(label);
+            item.Click += (_, _) => OpenUrl(url);
+            return item;
+        }
+    }
     protected override void Dispose(bool disposing)
     {
         if (_disposed)
@@ -975,22 +1171,51 @@ sealed class TrayContext : ApplicationContext
         _disposed = true;
         if (disposing)
         {
-            try { SystemEvents.SessionEnding -= OnSessionEnding; } catch (Exception ex) { Program.LogError(ex); }
-            _startupCts.Cancel();
-            _startupCts.Dispose();
-            _pollTimer.Stop();
-            _hotkeyRetryTimer.Stop();
-            _pollTimer.Dispose();
-            _hotkeyRetryTimer.Dispose();
-            _hotkeyWindow.HotkeyPressed -= OnHotkeyPressed;
-            _hotkeyWindow.Dispose();
-            _copilotHook.Pressed -= OnHotkeyPressed;
-            _copilotHook.Dispose();
-            _icon.Visible = false;
-            _icon.ContextMenuStrip?.Dispose();
-            _icon.ContextMenuStrip = null;
-            _icon.Dispose();
+            Step(() => _icon.Visible = false);
+            Step(() =>
+            {
+                SystemEvents.SessionEnded -= OnSessionEnded;
+                SystemEvents.PowerModeChanged -= OnPowerModeChanged;
+            });
+            Step(ConfigStore.FlushPending);
+            Step(() =>
+            {
+                _startupCts.Cancel();
+                _startupCts.Dispose();
+            });
+            Step(() =>
+            {
+                _fallbackTimer.Stop();
+                _fallbackTimer.Dispose();
+            });
+            Step(() =>
+            {
+                _hotkeyRetryTimer.Stop();
+                _hotkeyRetryTimer.Dispose();
+            });
+            Step(() =>
+            {
+                _hotkeyWindow.HotkeyPressed -= OnHotkeyPressed;
+                _hotkeyWindow.Dispose();
+            });
+            Step(() =>
+            {
+                _copilotHook.Pressed -= OnHotkeyPressed;
+                _copilotHook.Dispose();
+            });
+            Step(() =>
+            {
+                _icon.ContextMenuStrip?.Dispose();
+                _icon.ContextMenuStrip = null;
+                _icon.Dispose();
+            });
+            Step(IconFactory.Release);
         }
         base.Dispose(disposing);
+        static void Step(Action action)
+        {
+            try { action(); }
+            catch (Exception ex) { Program.LogError(ex); }
+        }
     }
 }
