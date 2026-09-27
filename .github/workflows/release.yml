@@ -120,6 +120,22 @@ jobs:
           name: TurboToggle-win-x64-setup
           path: assets
 
+      - name: Compute SHA-256 hashes
+        shell: bash
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            tag="$INPUT_TAG"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+          version="${tag#v}"
+          cd assets
+          sha256sum TurboToggle-portable.exe > SHA256SUMS.txt
+          sha256sum "TurboToggle-${version}-setup.msi" >> SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
       - name: Publish release
         shell: bash
         env:
@@ -138,10 +154,37 @@ jobs:
           if gh release view "$tag" --repo "$repo" >/dev/null 2>&1; then
             gh release upload "$tag" assets/TurboToggle-portable.exe --repo "$repo" --clobber
             gh release upload "$tag" "assets/TurboToggle-${version}-setup.msi" --repo "$repo" --clobber
+            gh release upload "$tag" assets/SHA256SUMS.txt --repo "$repo" --clobber
+            gh release edit "$tag" --repo "$repo" --notes "$(cat <<EOF
+          Automated build of Turbo Boost Toggle ${tag}.
+
+          ## Assets
+
+          | File | Description |
+          |------|-------------|
+          | \`TurboToggle-portable.exe\` | Portable single-file executable. Run from any folder. |
+          | \`TurboToggle-${version}-setup.msi\` | Windows Installer (MSI). Installs to Program Files with Start Menu shortcut. Supports upgrade/uninstall via Windows Settings. |
+
+          ## SHA-256 Checksums
+
+          \`\`\`
+          $(cat assets/SHA256SUMS.txt)
+          \`\`\`
+
+          ## Installation
+
+          **Portable:** Download \`TurboToggle-portable.exe\`, run it, allow the UAC prompt. No installation needed.
+
+          **Installer:** Download the \`.msi\`, double-click, follow the wizard. The app installs to \`Program Files\\Turbo Toggle\` and adds a Start Menu shortcut. Uninstall via Settings > Apps > Installed apps.
+
+          Both versions require administrator privileges and store settings in \`%APPDATA%\\TurboToggle\`.
+          EOF
+          )"
           else
             gh release create "$tag" \
               assets/TurboToggle-portable.exe \
               "assets/TurboToggle-${version}-setup.msi" \
+              assets/SHA256SUMS.txt \
               --repo "$repo" \
               --verify-tag \
               --title "Turbo Boost Toggle $tag" \
@@ -154,6 +197,12 @@ jobs:
           |------|-------------|
           | \`TurboToggle-portable.exe\` | Portable single-file executable. Run from any folder. |
           | \`TurboToggle-${version}-setup.msi\` | Windows Installer (MSI). Installs to Program Files with Start Menu shortcut. Supports upgrade/uninstall via Windows Settings. |
+
+          ## SHA-256 Checksums
+
+          \`\`\`
+          $(cat assets/SHA256SUMS.txt)
+          \`\`\`
 
           ## Installation
 
