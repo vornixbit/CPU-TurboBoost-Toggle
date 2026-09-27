@@ -16,28 +16,26 @@
       <ComponentGroupRef Id="Shortcuts" />
     </Feature>
 
-    <Directory Id="TARGETDIR" Name="SourceDir">
-      <Directory Id="ProgramFiles64Folder">
-        <Directory Id="INSTALLFOLDER" Name="Turbo Toggle">
-          <Component Id="MainExe" Guid="B2C3D4E5-F6A7-8901-BCDE-F12345678901">
-            <File Id="TurboToggleExe" Source="$(var.SourcePath)\TurboToggle.exe" KeyPath="yes" />
-          </Component>
-        </Directory>
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Turbo Toggle">
+        <Component Id="MainExe" Guid="B2C3D4E5-F6A7-8901-BCDE-F12345678901">
+          <File Id="TurboToggleExe" Source="$(var.SourcePath)\TurboToggle-portable.exe" KeyPath="yes" />
+        </Component>
       </Directory>
-      <Directory Id="ProgramMenuFolder">
-        <Directory Id="AppProgramMenuDir" Name="Turbo Toggle">
-          <Component Id="AppShortcut" Guid="C3D4E5F6-A7B8-9012-CDEF-123456789012">
-            <Shortcut Id="AppStartMenuShortcut"
-                      Name="Turbo Toggle"
-                      Description="System-tray toggle for Intel Turbo Boost"
-                      Target="[INSTALLFOLDER]TurboToggle.exe"
-                      WorkingDirectory="INSTALLFOLDER" />
-            <RemoveFolder Id="RemoveAppProgramMenuDir" On="uninstall" />
-            <RegistryValue Root="HKCU" Key="Software\TurboToggle" Name="installed" Type="integer" Value="1" KeyPath="yes" />
-          </Component>
-        </Directory>
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="AppProgramMenuDir" Name="Turbo Toggle">
+        <Component Id="AppShortcut" Guid="C3D4E5F6-A7B8-9012-CDEF-123456789012">
+          <Shortcut Id="AppStartMenuShortcut"
+                    Name="Turbo Toggle"
+                    Description="System-tray toggle for Intel Turbo Boost"
+                    Target="[INSTALLFOLDER]TurboToggle-portable.exe"
+                    WorkingDirectory="INSTALLFOLDER" />
+          <RemoveFolder Id="RemoveAppProgramMenuDir" On="uninstall" />
+          <RegistryValue Root="HKCU" Key="Software\TurboToggle" Name="installed" Type="integer" Value="1" KeyPath="yes" />
+        </Component>
       </Directory>
-    </Directory>
+    </StandardDirectory>
 
     <ComponentGroup Id="ProductComponents" Directory="INSTALLFOLDER">
       <ComponentRef Id="MainExe" />
